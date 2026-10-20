@@ -52,6 +52,17 @@ Disk (per-mount total/used/free GB), server type (VM / container / bare metal),
 access level (root / user), public IP, bandwidth (interface + speed),
 listening ports, top processes by CPU/RAM.
 
+Notes on how a few of these are measured:
+
+- **CPU usage** is a `/proc/stat` delta sampled 1 second apart, not `top -bn1`
+  (which reports the since-boot average and reads ~0% on an idle host).
+- **Bandwidth** comes from `/sys/class/net/*/speed`; `ip link` carries no speed.
+  Interfaces that report `-1` (virtual, bridge, tunnel) show as `NA`.
+- **Public IP** only accepts a bare address; if the lookup service returns an
+  error page the field is `unknown` rather than the HTML body.
+- **Disk** uses GNU `df --output` with a POSIX `df -P -h` fallback
+  (busybox/Alpine have no `--output`).
+
 ## Output
 
 - Terminal: one row per server in a table.
@@ -59,7 +70,9 @@ listening ports, top processes by CPU/RAM.
 - Log: `server_monitor.log` with per-connection and per-command failures.
 
 A server that fails to connect is reported as failed and the run continues.
-A single metric that fails does not abort the rest of that server's checks.
+A single metric that fails does not abort the rest of that server's checks;
+those failures land in `partial_errors` and the status column shows
+`⚠️ N partial`.
 
 ## License
 
