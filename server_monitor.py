@@ -5,12 +5,14 @@ Collects system information from multiple servers via SSH in parallel batches.
 """
 
 import argparse
+import importlib
 import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -38,14 +40,15 @@ def _run(cmd: List[str], timeout: int = 120) -> bool:
 
 def _install_paramiko() -> bool:
     """Install paramiko using whatever package manager this host has."""
-    import importlib
-
     def _importable() -> bool:
         try:
             importlib.import_module("paramiko")
             return True
         except ImportError:
             return False
+
+    if _importable():
+        return True
 
     strategies: List[List[List[str]]] = []
 
@@ -66,18 +69,57 @@ def _install_paramiko() -> bool:
         if shutil.which(pip):
             pip_cmds.append([pip, "install", "paramiko"])
             pip_cmds.append([pip, "install", "--break-system-packages", "paramiko"])
+            pip_cmds.append([pip, "install", "--user", "paramiko"])
             break
-    pip_cmds.append([sys.executable, "-m", "pip", "install", "paramiko"])
-    pip_cmds.append([sys.executable, "-m", "pip", "install", "--break-system-packages", "paramiko"])
+    for extra in ([], ["--break-system-packages"], ["--user"]):
+        pip_cmds.append([sys.executable, "-m", "pip", "install"] + extra + ["paramiko"])
     if shutil.which("uv"):
-        pip_cmds.append(["uv", "pip", "install", "--system", "paramiko"])
+        pip_cmds.append(["uv", "pip", "install", "--system", "--break-system-packages", "paramiko"])
     strategies.append(pip_cmds)
 
     for group in strategies:
         for cmd in group:
             if _run(cmd) and _importable():
                 return True
+
+    # Last resort: private venv (works without root), then import from it.
+    venv_dir = os.path.join(tempfile.gettempdir(), "server_monitor_venv")
+    if _run([sys.executable, "-m", "venv", venv_dir], timeout=180):
+        vpy = os.path.join(venv_dir, "bin", "python3")
+        if not os.path.exists(vpy):
+            vpy = os.path.join(venv_dir, "Scripts", "python.exe")
+        vpip = os.path.join(venv_dir, "bin", "pip")
+        if os.path.exists(vpip):
+            if _run([vpip, "install", "paramiko"], timeout=300):
+                _venv_site_packages(venv_dir)
+                return _importable()
+        # ensurepip missing -> bootstrap pip with get-pip.py (stdlib only)
+        try:
+            import urllib.request
+            getpip = os.path.join(venv_dir, "get-pip.py")
+            urllib.request.urlretrieve("https://bootstrap.pypa.io/get-pip.py", getpip)
+            if _run([vpy, getpip], timeout=300):
+                if _run([vpy, "-m", "pip", "install", "paramiko"], timeout=300):
+                    _venv_site_packages(venv_dir)
+                    return _importable()
+        except Exception as e:
+            print(f"    ! venv bootstrap error: {e}", file=sys.stderr)
+
     return _importable()
+
+
+def _venv_site_packages(venv_dir: str) -> None:
+    """Make a venv's site-packages importable from the running interpreter."""
+    import site
+    for lib in ("lib", "lib64"):
+        base = os.path.join(venv_dir, lib)
+        if not os.path.isdir(base):
+            continue
+        for entry in os.listdir(base):
+            sp = os.path.join(base, entry, "site-packages")
+            if os.path.isdir(sp) and sp not in sys.path:
+                sys.path.append(sp)
+                site.addsitedir(sp)
 
 
 def _bootstrap() -> None:
@@ -92,7 +134,6 @@ def _bootstrap() -> None:
               "      apk add py3-paramiko              (Alpine)\n"
               "      pip install paramiko              (pip)", file=sys.stderr)
         sys.exit(1)
-    import importlib
     paramiko = importlib.import_module("paramiko")
     print("[+] 'paramiko' ready.", file=sys.stderr)
 
@@ -137,7 +178,7 @@ class Report:
 
 
 # --- SSH Commands ---
-# Read-only probes, safe to run on any Linux host.
+# Commands defined in contracts/ssh-commands.md
 
 SSH_COMMANDS = {
     "os": "cat /etc/os-release 2>/dev/null || (cat /etc/redhat-release 2>/dev/null && cat /etc/issue 2>/dev/null) || uname -srm",
