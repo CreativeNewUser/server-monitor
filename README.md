@@ -24,14 +24,14 @@ Nothing to install manually. The script auto-installs `paramiko` on first run
 On a fresh server, with `servers.txt` already created:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/Radencex/server-monitor/main/server_monitor.py -o server_monitor.py
+curl -sSL https://raw.githubusercontent.com/OWNER/server-monitor/main/server_monitor.py -o server_monitor.py
 python3 server_monitor.py servers.txt --max-workers 10 --timeout 15 --output report.json
 ```
 
 Or in one line:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/Radencex/server-monitor/main/server_monitor.py | python3 - servers.txt --max-workers 10 --timeout 15 --output report.json
+curl -sSL https://raw.githubusercontent.com/OWNER/server-monitor/main/server_monitor.py | python3 - servers.txt --max-workers 10 --timeout 15 --output report.json
 ```
 
 ## Options
