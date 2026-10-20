@@ -1,6 +1,6 @@
 # Server Monitor (Parallel SSH)
 
-Standalone script that reads a credentials file and collects system metrics from many servers over SSH in parallel.
+Standalone script that reads a credentials file and collects system metrics from many servers over SSH in parallel. It also detects (and where possible installs) the 3x-ui panel on each host.
 
 ## Input format
 
@@ -36,19 +36,18 @@ curl -sSL https://raw.githubusercontent.com/CreativeNewUser/server-monitor/main/
 
 ## Options
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `input_file` (positional) | — | Path to the credentials file |
-| `--max-workers N` | `10` | Max concurrent SSH sessions |
-| `--timeout N` | `15` | Per-command timeout in seconds |
-| `--output PATH` | `report_<ts>.json` | JSON report path |
-| `--quiet` | off | Suppress the terminal table |
-| `--log PATH` | `server_monitor.log` | Log file path |
+- `input_file` (positional) — path to the credentials file
+- `--max-workers N` — max concurrent SSH sessions (default `10`)
+- `--timeout N` — per-command timeout in seconds (default `15`)
+- `--install-timeout N` — timeout for the 3x-ui installer in seconds (default `600`)
+- `--output PATH` — JSON report path (default `report_<ts>.json`)
+- `--text-output PATH` — plain-text report path (default `report_<ts>.txt`)
+- `--log PATH` — log file path (default `server_monitor.log`)
 
 ## Collected metrics
 
 OS (name/version/kernel), CPU (model, cores, usage), RAM (total/used/free MB),
-Disk (per-mount total/used/free GB), server type (VM / container / bare metal),
+Disk (root filesystem total/used/free GB), server type (VM / container / bare metal),
 access level (root / user), public IP, bandwidth (interface + speed),
 listening ports, top processes by CPU/RAM.
 
@@ -61,18 +60,45 @@ Notes on how a few of these are measured:
 - **Public IP** only accepts a bare address; if the lookup service returns an
   error page the field is `unknown` rather than the HTML body.
 - **Disk** uses GNU `df --output` with a POSIX `df -P -h` fallback
-  (busybox/Alpine have no `--output`).
+  (busybox/Alpine have no `--output`). Only the root filesystem is reported.
+- **A probe fails only when the remote command exits non-zero** or its output
+  cannot be parsed. A warning on stderr alone is not a failure — many minimal
+  hosts print one while still returning a valid result.
+
+## 3x-ui panel
+
+For every host the script:
+
+1. checks whether a 3x-ui panel is already installed
+   (`/usr/local/x-ui/x-ui`, the `x-ui` command, or `/etc/x-ui/x-ui.db`);
+2. if not, installs it with the upstream installer and all options at their
+   defaults (`XUI_NONINTERACTIVE=1`);
+3. reads back the panel port, web base path, username and password.
+
+The installer needs root. A root session runs it directly; a non-root user is
+elevated with `sudo -S` and the same password as the SSH user. The password is
+written to the remote stdin, never into the command line.
+
+Panel state per server is one of:
+
+- `installed` — installed by this run
+- `preexisting` — already present, left untouched
+- `not_attempted` — could not be installed because root access was unavailable
+- `failed` — the installer ran but did not succeed
+
+The report lists the servers with a working panel in their own section, with the
+panel URL, username and password.
 
 ## Output
 
-- Terminal: one row per server in a table.
-- File: full JSON report, including per-server `partial_errors` and `error` fields.
+- Files: a JSON report and a plain-text report. Both contain the 3x-ui results,
+  per-server `partial_errors` and `error` fields. Both are written with mode
+  `600` because they contain panel credentials.
 - Log: `server_monitor.log` with per-connection and per-command failures.
 
-A server that fails to connect is reported as failed and the run continues.
-A single metric that fails does not abort the rest of that server's checks;
-those failures land in `partial_errors` and the status column shows
-`⚠️ N partial`.
+There is no terminal table. A server that fails to connect is reported as
+failed and the run continues. A single metric that fails does not abort the
+rest of that server's checks; those failures land in `partial_errors`.
 
 ## License
 

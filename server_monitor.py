@@ -151,6 +151,19 @@ class Server:
 
 
 @dataclass
+class Panel3xUI:
+    """3x-ui panel state for one server."""
+    state: str = "not_attempted"  # installed | preexisting | failed | not_attempted
+    url: Optional[str] = None
+    port: Optional[int] = None
+    web_base_path: Optional[str] = None
+    username: Optional[str] = None
+    password: Optional[str] = None
+    reason: Optional[str] = None
+    install_log: Optional[str] = None
+
+
+@dataclass
 class ServerInfo:
     """Structured data collected from a server."""
     server: Server
@@ -167,6 +180,7 @@ class ServerInfo:
     ports: Optional[List[int]] = None
     top_processes: Optional[List[Dict[str, Any]]] = None
     partial_errors: List[str] = field(default_factory=list)
+    x3ui: Optional[Panel3xUI] = None
 
 
 @dataclass
@@ -176,6 +190,7 @@ class Report:
     input_file: str
     servers: List[ServerInfo] = field(default_factory=list)
     summary: Dict[str, int] = field(default_factory=dict)
+    x3ui_summary: Dict[str, int] = field(default_factory=dict)
 
 
 # --- SSH Commands ---
@@ -262,7 +277,11 @@ def parse_ram(output: str) -> Dict[str, int]:
 
 
 def parse_disk(output: str) -> List[Dict[str, Any]]:
-    """Parse disk info from df output."""
+    """Parse disk info from df output — root filesystem only.
+
+    The fleet report only needs the total and used space of "/"; per-mount
+    detail (tmpfs, devtmpfs, efivarfs, ...) is noise.
+    """
     disks = []
     for line in output.strip().splitlines():
         parts = line.split()
@@ -284,7 +303,15 @@ def parse_disk(output: str) -> List[Dict[str, Any]]:
                 })
             except (ValueError, IndexError):
                 continue
-    return disks
+
+    root = next((d for d in disks if d["mount"] == "/"), None)
+    if root:
+        return [root]
+    # No "/" in the output (unusual) — fall back to the largest real filesystem.
+    real = [d for d in disks if d["total"] > 0]
+    if not real:
+        return []
+    return [max(real, key=lambda d: d["total"])]
 
 
 def parse_server_type(output: str) -> str:
@@ -391,41 +418,58 @@ def ssh_connect(server: Server, timeout: int = 15) -> Optional[Any]:
         return None
 
 
-def run_ssh_command(client: Any, command: str, timeout: int = 15) -> Tuple[str, Optional[str]]:
+def run_ssh_command(client: Any, command: str, timeout: int = 15) -> Tuple[str, str, int]:
     """Run a command on a remote server via SSH.
 
-    Returns (stdout, error). error is None on success.
+    Returns (stdout, stderr, exit_code).
+
+    The exit code is what decides whether a probe failed. stderr is returned
+    for diagnostics only: on minimal hosts many tools print a warning to
+    stderr while still producing a valid result, and treating that as a
+    failure is what made 35 of 36 servers look "partial".
     """
     try:
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
         output = stdout.read().decode("utf-8", errors="ignore")
         error = stderr.read().decode("utf-8", errors="ignore")
-        if error:
-            error = error.strip()
-        return output, (error or None)
+        # Drain both pipes before asking for the status, otherwise
+        # recv_exit_status() can block until the remote command closes.
+        try:
+            exit_code = stdout.channel.recv_exit_status()
+        except Exception:
+            exit_code = 0
+        return output, error.strip(), exit_code
     except Exception as e:
         logging.error(f"Command failed: {command[:50]}... -> {e}")
-        return "", str(e)
+        return "", str(e), 255
 
 
 # --- Data Collection ---
 
-def collect_server_info(server: Server, timeout: int = 15) -> ServerInfo:
-    """Collect all information from a server."""
+def collect_server_info(server: Server, timeout: int = 15, install_timeout: int = 600) -> ServerInfo:
+    """Collect all information from a server, including the 3x-ui panel state."""
     info = ServerInfo(server=server, success=False, error=None, partial_errors=[])
     client = ssh_connect(server, timeout)
     if not client:
         info.error = f"SSH connection failed for {server.ip}:{server.port}"
+        info.x3ui = Panel3xUI(state="not_attempted", reason="server unreachable")
         return info
 
     def probe(name: str, parser: Any) -> Any:
-        """Run one probe; on failure record it and return None instead of raising."""
-        raw, err = run_ssh_command(client, SSH_COMMANDS[name], timeout)
-        if err:
-            info.partial_errors.append(f"{name}: {err[:120]}")
-        if not raw.strip():
-            info.partial_errors.append(f"{name}: empty output")
+        """Run one probe.
+
+        A probe fails only when the remote command exited non-zero or its
+        output could not be parsed. stderr is recorded for diagnostics but
+        never decides the verdict on its own, and an empty output with a
+        zero exit code is a legitimate empty value, not a failure.
+        """
+        raw, err, code = run_ssh_command(client, SSH_COMMANDS[name], timeout)
+        if code != 0:
+            detail = err[:120] if err else f"exit status {code}"
+            info.partial_errors.append(f"{name}: {detail}")
             return None
+        if not raw.strip():
+            return parser(raw)
         try:
             return parser(raw)
         except Exception as e:
@@ -436,9 +480,9 @@ def collect_server_info(server: Server, timeout: int = 15) -> ServerInfo:
         info.os = probe("os", parse_os)
         info.cpu = probe("cpu_info", parse_cpu_info)
 
-        usage_raw, usage_err = run_ssh_command(client, SSH_COMMANDS["cpu_usage"], timeout)
-        if usage_err:
-            info.partial_errors.append(f"cpu_usage: {usage_err[:120]}")
+        usage_raw, _, usage_code = run_ssh_command(client, SSH_COMMANDS["cpu_usage"], timeout)
+        if usage_code != 0:
+            info.partial_errors.append(f"cpu_usage: exit status {usage_code}")
         if info.cpu is not None:
             info.cpu["usage"] = parse_cpu_usage(usage_raw) if usage_raw.strip() else None
 
@@ -452,6 +496,13 @@ def collect_server_info(server: Server, timeout: int = 15) -> ServerInfo:
         info.top_processes = probe("top_processes", parse_top_processes)
 
         info.success = True
+
+        # 3x-ui phase: detect, install if missing, read back the access data.
+        # Runs while the connection is still open.
+        try:
+            info.x3ui = collect_xui(server, client, timeout, install_timeout)
+        except Exception as e:
+            info.x3ui = Panel3xUI(state="failed", reason=f"3x-ui check error: {e}")
     except Exception as e:
         info.error = str(e)
         logging.error(f"Error collecting info from {server.ip}: {e}")
@@ -501,117 +552,485 @@ def parse_input_file(file_path: str) -> List[Server]:
     return servers
 
 
+# --- 3x-ui Panel ---
+
+XUI_INSTALL_URL = "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
+XUI_RESULT_FILE = "/etc/x-ui/install-result.env"
+XUI_BIN = "/usr/local/x-ui/x-ui"
+
+# Is the panel already installed? The Go binary is the primary signal; the
+# management script and the service unit are fallbacks.
+XUI_DETECT_CMD = (
+    "if [ -x /usr/local/x-ui/x-ui ]; then echo PRESENT; "
+    "elif command -v x-ui >/dev/null 2>&1; then echo PRESENT; "
+    "elif [ -f /etc/x-ui/x-ui.db ]; then echo PRESENT; "
+    "else echo ABSENT; fi"
+)
+
+# The Go binary prints the current panel settings. `x-ui setting` is NOT a
+# subcommand of the bash management script, so the binary is called directly.
+XUI_SHOW_CMD = f"{XUI_BIN} setting -show true 2>/dev/null"
+
+# The installer's own machine-readable result file (root-only, mode 600).
+XUI_RESULT_CMD = f"cat {XUI_RESULT_FILE} 2>/dev/null"
+
+# Root check without touching anything.
+XUI_ROOT_CMD = "id -u"
+
+
+def parse_xui_settings(output: str) -> Dict[str, Any]:
+    """Parse `x-ui setting -show true` output.
+
+    Yields port, web_base_path and has_default_credential. The password is
+    not recoverable from the binary — only whether the default one is set.
+    """
+    result: Dict[str, Any] = {"port": None, "web_base_path": None, "has_default_credential": None}
+    for line in output.splitlines():
+        line = line.strip()
+        if line.startswith("port:"):
+            try:
+                result["port"] = int(line.split(":", 1)[1].strip())
+            except ValueError:
+                pass
+        elif line.startswith("webBasePath:"):
+            result["web_base_path"] = line.split(":", 1)[1].strip() or None
+        elif line.startswith("hasDefaultCredential:"):
+            result["has_default_credential"] = line.split(":", 1)[1].strip().lower() == "true"
+    return result
+
+
+def parse_xui_result_env(output: str) -> Dict[str, Any]:
+    """Parse /etc/x-ui/install-result.env (the installer's own output)."""
+    result: Dict[str, Any] = {
+        "username": None, "password": None, "port": None,
+        "web_base_path": None, "url": None,
+    }
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip().strip('"').strip("'")
+        if key == "XUI_USERNAME":
+            result["username"] = value or None
+        elif key == "XUI_PASSWORD":
+            result["password"] = value or None
+        elif key == "XUI_PANEL_PORT":
+            try:
+                result["port"] = int(value)
+            except ValueError:
+                pass
+        elif key == "XUI_WEB_BASE_PATH":
+            result["web_base_path"] = value or None
+        elif key == "XUI_ACCESS_URL":
+            result["url"] = value or None
+    return result
+
+
+def build_xui_url(host: str, port: Optional[int], web_base_path: Optional[str], scheme: str = "http") -> Optional[str]:
+    """Compose the panel web URL."""
+    if not port:
+        return None
+    base = f"{scheme}://{host}:{port}"
+    if web_base_path:
+        base += f"/{web_base_path}"
+    return base
+
+
+def is_root(client: Any, timeout: int = 30) -> bool:
+    """Return True when the SSH session already runs as root."""
+    out, _, _ = run_ssh_command(client, XUI_ROOT_CMD, timeout)
+    return out.strip() == "0"
+
+
+def run_privileged(client: Any, password: str, command: str, timeout: int = 15) -> Tuple[str, str, int]:
+    """Run a command with root privileges.
+
+    Already-root sessions run the command as-is. Otherwise `sudo -S -p ''`
+    takes the password from the remote stdin — the password is never put in
+    the command string, so it cannot leak into the process list or the log.
+    """
+    if is_root(client):
+        return run_ssh_command(client, command, timeout)
+
+    sudo_cmd = f"sudo -S -p '' {command}"
+    try:
+        stdin, stdout, stderr = client.exec_command(sudo_cmd, timeout=timeout)
+        stdin.write(password + "\n")
+        stdin.flush()
+        output = stdout.read().decode("utf-8", errors="ignore")
+        error = stderr.read().decode("utf-8", errors="ignore")
+        try:
+            exit_code = stdout.channel.recv_exit_status()
+        except Exception:
+            exit_code = 0
+    except Exception as e:
+        return "", str(e), 255
+    return output, error.strip(), exit_code
+
+
+def detect_xui(client: Any, timeout: int = 15) -> bool:
+    """Return True when a 3x-ui panel is already installed on the host."""
+    out, _, _ = run_ssh_command(client, XUI_DETECT_CMD, timeout)
+    return "PRESENT" in out
+
+
+def read_xui_state(client: Any, password: str, timeout: int = 15) -> Dict[str, Any]:
+    """Read the panel's port/base path and credentials, if readable.
+
+    The credential file is root-only, so the read is retried with sudo when
+    the plain read comes back empty.
+    """
+    state: Dict[str, Any] = {
+        "port": None, "web_base_path": None, "username": None, "password": None,
+    }
+
+    out, _, _ = run_ssh_command(client, XUI_RESULT_CMD, timeout)
+    if not out.strip():
+        out, _, _ = run_privileged(client, password, f"cat {XUI_RESULT_FILE}", timeout)
+    if out.strip():
+        state.update({k: v for k, v in parse_xui_result_env(out).items() if v})
+
+    show_out, _, _ = run_ssh_command(client, XUI_SHOW_CMD, timeout)
+    if not show_out.strip():
+        show_out, _, _ = run_privileged(client, password, XUI_SHOW_CMD, timeout)
+    if show_out.strip():
+        settings = parse_xui_settings(show_out)
+        if state.get("port") is None:
+            state["port"] = settings["port"]
+        if state.get("web_base_path") is None:
+            state["web_base_path"] = settings["web_base_path"]
+    return state
+
+
+def install_xui(client: Any, password: str, timeout: int = 600) -> Tuple[bool, str, str]:
+    """Install 3x-ui with the upstream installer, all options at their defaults.
+
+    The installer requires EUID 0, so a non-root user is elevated with
+    `sudo -S`; the SSH password is written to the remote stdin, never into
+    the command string. NONINTERACTIVE=1 makes the installer take its own
+    defaults instead of prompting. Returns (ok, output_tail, mode) where
+    mode is "root" or "sudo".
+    """
+    # `bash <(curl ...)` needs process substitution, which only works in bash.
+    # A dash-based login shell aborts on it, so the script is piped into bash
+    # instead — same result, no bashism in the outer command.
+    install_cmd = f"curl -Ls {XUI_INSTALL_URL} | bash"
+    root = is_root(client)
+
+    if root:
+        command = f"export XUI_NONINTERACTIVE=1; {install_cmd}"
+        mode = "root"
+    else:
+        # `sudo -S -p ''` takes the password from stdin and prints no prompt,
+        # so only the password reaches the remote stdin. `env` passes the
+        # non-interactive switch through to the installer.
+        command = f"sudo -S -p '' env XUI_NONINTERACTIVE=1 bash -c '{install_cmd}'"
+        mode = "sudo"
+
+    try:
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        if not root:
+            stdin.write(password + "\n")
+            stdin.flush()
+        # Close stdin so the installer gets EOF instead of blocking on a
+        # prompt that NONINTERACTIVE=1 was supposed to skip.
+        try:
+            stdin.channel.shutdown_write()
+        except Exception:
+            pass
+        output = stdout.read().decode("utf-8", errors="ignore")
+        error = stderr.read().decode("utf-8", errors="ignore")
+        try:
+            exit_code = stdout.channel.recv_exit_status()
+        except Exception:
+            exit_code = 0
+    except Exception as e:
+        return False, f"install command error: {e}", mode
+
+    tail = (output + "\n" + error).strip()
+    if exit_code != 0:
+        return False, tail, mode
+    lowered = tail.lower()
+    if "root privilege" in lowered or "please run this script with root" in lowered:
+        return False, tail, mode
+    return True, tail, mode
+
+
+def _xui_failure_reason(tail: str) -> str:
+    """Turn the installer's output into a one-line reason."""
+    lowered = tail.lower()
+    if "not in the sudoers" in lowered:
+        return "root required (user is not in the sudoers file)"
+    if "incorrect password" in lowered or "authentication failure" in lowered:
+        return "root required (sudo password rejected)"
+    if "command not found" in lowered and "curl" in lowered:
+        return "curl is not available on this host"
+    if "no space left" in lowered:
+        return "not enough disk space on the host"
+    if "could not resolve" in lowered or "couldn't resolve" in lowered:
+        return "host cannot reach the internet (DNS failure)"
+    if "connection refused" in lowered or "timed out" in lowered:
+        return "host cannot reach the download host"
+    for line in reversed(tail.splitlines()):
+        line = line.strip()
+        if line:
+            return line[:200]
+    return "installer failed"
+
+
+def collect_xui(server: Server, client: Any, timeout: int = 15, install_timeout: int = 600) -> Panel3xUI:
+    """Detect, install if needed, and read back the 3x-ui panel state."""
+    panel = Panel3xUI()
+
+    try:
+        if detect_xui(client, timeout):
+            panel.state = "preexisting"
+            state = read_xui_state(client, server.password, timeout)
+            panel.port = state.get("port")
+            panel.web_base_path = state.get("web_base_path")
+            panel.username = state.get("username")
+            panel.password = state.get("password")
+            if not panel.port:
+                panel.reason = "panel present but settings unreadable (root required)"
+            else:
+                panel.url = build_xui_url(server.ip, panel.port, panel.web_base_path)
+                if not panel.username:
+                    panel.reason = "panel present; credentials not readable without root"
+            return panel
+
+        # Not installed. The installer requires root; a non-root user is
+        # elevated with `sudo -S` and the SSH password.
+        ok, tail, mode = install_xui(client, server.password, install_timeout)
+        panel.install_log = tail[-2000:]
+        if not ok:
+            lowered = tail.lower()
+            if ("not in the sudoers" in lowered
+                    or "incorrect password" in lowered
+                    or "authentication failure" in lowered
+                    or "root privilege" in lowered
+                    or "please run this script with root" in lowered):
+                panel.state = "not_attempted"
+                panel.reason = "root required (sudo unavailable for this user)"
+            else:
+                panel.state = "failed"
+                panel.reason = _xui_failure_reason(tail)
+            return panel
+
+        panel.state = "installed"
+        # Verify the panel is really there before claiming success.
+        if not detect_xui(client, timeout):
+            panel.state = "failed"
+            panel.reason = "installer finished but the panel binary was not found"
+            return panel
+        state = read_xui_state(client, server.password, timeout)
+        panel.port = state.get("port")
+        panel.web_base_path = state.get("web_base_path")
+        panel.username = state.get("username")
+        panel.password = state.get("password")
+        panel.url = build_xui_url(server.ip, panel.port, panel.web_base_path)
+        if not panel.username or not panel.password:
+            panel.reason = "installed, but credentials not readable (credential file is root-only)"
+        return panel
+
+    except Exception as e:
+        panel.state = "failed"
+        panel.reason = f"3x-ui check error: {e}"
+        return panel
+
 # --- Output ---
 
-def generate_table(report: Report) -> str:
-    """Generate a markdown table from the report."""
-    headers = [
-        "Server", "OS", "CPU", "RAM (MB)", "Disk (GB)", "Type", 
-        "Access", "Public IP", "Bandwidth", "Ports", "Top Processes", "Status"
-    ]
-    rows = []
-    for info in report.servers:
-        if not info.success:
-            status = "❌"
-        elif info.partial_errors:
-            status = f"⚠️ {len(info.partial_errors)} partial"
+def generate_text_report(report: Report) -> str:
+    """Generate a plain-text report — one readable block per server.
+
+    No table: the fleet report has to stay readable without horizontal
+    scrolling, and the 3x-ui credentials need their own labelled lines.
+    """
+    lines: List[str] = []
+    lines.append("=" * 72)
+    lines.append("SERVER MONITOR REPORT")
+    lines.append(f"Generated: {report.timestamp}")
+    lines.append(f"Input:     {report.input_file}")
+    lines.append("=" * 72)
+    lines.append("")
+
+    for idx, info in enumerate(report.servers, 1):
+        host = f"{info.server.ip}:{info.server.port}"
+        lines.append("-" * 72)
+        lines.append(f"Server {idx}: {host}   (user: {info.server.username})")
+        lines.append("-" * 72)
+
+        if info.error:
+            lines.append(f"  Error:      {info.error}")
         else:
-            status = "✅"
-        os_str = "?"
-        if info.os:
-            os_name = info.os.get('name', '?')
-            os_version = info.os.get('version', '')
-            os_str = f"{os_name} {os_version}".strip()
-        cpu_str = "?"
-        if info.cpu:
-            model = info.cpu.get('model', '?')
-            usage = info.cpu.get('usage')
-            if usage is None:
-                cpu_str = model
-            else:
-                cpu_str = f"{model} ({usage}%)"
-        ram_str = "?"
-        if info.ram:
-            ram_str = str(info.ram.get('total', 0))
-        disk_list = info.disk or []
-        # Only real filesystems, not tmpfs/devtmpfs/efivarfs pseudo-mounts.
-        disk_list = [d for d in disk_list if d["total"] > 0]
-        root = next((d for d in disk_list if d["mount"] == "/"), None)
-        if root:
-            disk_str = f"/: {root['total']}G total, {root['free']}G free"
-        elif disk_list:
-            disk_str = ", ".join(f"{d['mount']}:{d['total']}G" for d in disk_list[:2])
-        else:
-            disk_str = "?"
-        server_type = info.server_type or "?"
-        access = info.access_level or "?"
-        public_ip = info.public_ip or "?"
-        ifaces = info.bandwidth.get("interfaces", []) if info.bandwidth else []
-        ifaces = [i for i in ifaces if i["name"] != "lo"]
-        known = [i for i in ifaces if i["speed"] != "NA"]
-        if known:
-            bandwidth = ", ".join(f"{i['name']}:{i['speed']}Mb" for i in known[:3])
-        else:
-            bandwidth = "?"
-        ports = ", ".join(map(str, (info.ports or [])[:8])) or "?"
-        top_procs = ", ".join([f"{p['name']}({p['cpu_percent']}%CPU)" for p in (info.top_processes or [])[:3]]) or "?"
-        rows.append([
-            f"{info.server.ip}:{info.server.port}",
-            os_str,
-            cpu_str,
-            ram_str,
-            disk_str,
-            server_type,
-            access,
-            public_ip,
-            bandwidth,
-            ports,
-            top_procs,
-            status,
-        ])
-    
-    # Calculate column widths
-    col_widths = [max(len(str(row[i])) for row in [headers] + rows) for i in range(len(headers))]
-    
-    # Build table
-    table = []
-    table.append("|".join(f" {headers[i].ljust(col_widths[i])} " for i in range(len(headers))))
-    table.append("|".join("-" * (col_widths[i] + 2) for i in range(len(headers))))
-    for row in rows:
-        table.append("|".join(f" {str(row[i]).ljust(col_widths[i])} " for i in range(len(headers))))
-    
-    return "\n".join(table)
+            os_info = info.os or {}
+            os_str = " ".join(x for x in (os_info.get("name"), os_info.get("version")) if x) or "?"
+            lines.append(f"  OS:         {os_str}")
+
+            cpu = info.cpu or {}
+            model = cpu.get("model", "?")
+            usage = cpu.get("usage")
+            lines.append(f"  CPU:        {model}" + (f"  ({usage}%)" if usage is not None else ""))
+
+            ram = info.ram or {}
+            if ram:
+                lines.append(f"  RAM:        {ram.get('total', 0)} MB total, {ram.get('used', 0)} MB used")
+
+            disk = (info.disk or [None])[0]
+            if disk:
+                lines.append(f"  Disk:       /  {disk['total']} GB total, {disk['used']} GB used")
+
+            lines.append(f"  Type:       {info.server_type or '?'}")
+            lines.append(f"  Access:     {info.access_level or '?'}")
+            lines.append(f"  Public IP:  {info.public_ip or '?'}")
+
+            ifaces = (info.bandwidth or {}).get("interfaces", [])
+            known = [i for i in ifaces if i["name"] != "lo" and i["speed"] != "NA"]
+            if known:
+                lines.append("  Bandwidth:  " + ", ".join(f"{i['name']}: {i['speed']}Mb" for i in known))
+            elif ifaces:
+                lines.append("  Bandwidth:  " + ", ".join(f"{i['name']}: {i['speed']}" for i in ifaces if i["name"] != "lo"))
+
+            if info.ports:
+                lines.append(f"  Ports:      {', '.join(map(str, info.ports))}")
+
+            if info.top_processes:
+                procs = ", ".join(
+                    f"{p['name']} ({p['cpu_percent']}%CPU, {p['ram_percent']}%MEM)"
+                    for p in info.top_processes[:5]
+                )
+                lines.append(f"  Processes:  {procs}")
+
+        panel = info.x3ui
+        if panel:
+            label = {
+                "installed": "INSTALLED (by this run)",
+                "preexisting": "ALREADY PRESENT",
+                "failed": "INSTALL FAILED",
+                "not_attempted": "NOT INSTALLED",
+            }.get(panel.state, panel.state.upper())
+            lines.append(f"  3x-ui:      {label}")
+            if panel.url:
+                lines.append(f"  Panel URL:  {panel.url}")
+            if panel.username:
+                lines.append(f"  Username:   {panel.username}")
+            if panel.password:
+                lines.append(f"  Password:   {panel.password}")
+            if panel.reason:
+                lines.append(f"  Note:       {panel.reason}")
+
+        if info.partial_errors:
+            lines.append(f"  Warnings:   {len(info.partial_errors)} metric(s) unavailable")
+            for err in info.partial_errors:
+                lines.append(f"               - {err}")
+
+        lines.append("")
+
+    # --- 3x-ui categories ---
+    lines.append("=" * 72)
+    lines.append("3x-ui SUMMARY")
+    lines.append("=" * 72)
+
+    categories = {
+        "installed": "INSTALLED BY THIS RUN",
+        "preexisting": "ALREADY PRESENT",
+        "failed": "INSTALL FAILED",
+        "not_attempted": "NOT INSTALLED",
+    }
+    for state, title in categories.items():
+        servers = [
+            f"{i.server.ip}:{i.server.port}"
+            for i in report.servers
+            if i.x3ui and i.x3ui.state == state
+        ]
+        lines.append("")
+        lines.append(f"--- {title} ({len(servers)}) ---")
+        if not servers:
+            lines.append("    (none)")
+            continue
+        for entry in servers:
+            lines.append(f"    {entry}")
+
+    # Panel credentials, grouped for the servers that have them.
+    with_creds = [i for i in report.servers if i.x3ui and i.x3ui.username]
+    lines.append("")
+    lines.append("=" * 72)
+    lines.append("3x-ui PANEL ACCESS")
+    lines.append("=" * 72)
+    if not with_creds:
+        lines.append("    (no panel credentials available)")
+    for info in with_creds:
+        panel = info.x3ui
+        lines.append("")
+        lines.append(f"  {info.server.ip}:{info.server.port}")
+        lines.append(f"      URL:       {panel.url or '?'}")
+        lines.append(f"      Username:  {panel.username}")
+        lines.append(f"      Password:  {panel.password or '?'}")
+
+    lines.append("")
+    lines.append("=" * 72)
+    lines.append(f"SUMMARY: {report.summary}")
+    lines.append(f"3x-ui:   {report.x3ui_summary}")
+    lines.append("=" * 72)
+    return "\n".join(lines)
 
 
 def save_json(report: Report, output_path: Optional[str] = None) -> str:
-    """Save report as JSON."""
+    """Save report as JSON (mode 600 — it contains panel credentials)."""
     if output_path is None:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         output_path = f"report_{timestamp}.json"
-    
+
     # asdict converts nested dataclasses automatically
     report_dict = asdict(report)
-    
+    # Never write the SSH credentials of the input file into the report.
+    for entry in report_dict.get("servers", []):
+        entry.get("server", {}).pop("password", None)
+        entry.get("server", {}).pop("raw_line", None)
+
     with open(output_path, "w") as f:
         json.dump(report_dict, f, indent=2, ensure_ascii=False, default=str)
-    
+    try:
+        os.chmod(output_path, 0o600)
+    except OSError:
+        pass
+
+    return output_path
+
+
+def save_text_report(report: Report, output_path: Optional[str] = None) -> str:
+    """Save the plain-text report (mode 600 — it contains panel credentials)."""
+    if output_path is None:
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        output_path = f"report_{timestamp}.txt"
+    with open(output_path, "w") as f:
+        f.write(generate_text_report(report))
+    try:
+        os.chmod(output_path, 0o600)
+    except OSError:
+        pass
     return output_path
 
 
 # --- Parallel Execution ---
 
-def run_parallel(servers: List[Server], max_workers: int = 10, timeout: int = 15) -> Report:
-    """Run server monitoring in parallel batches."""
+def run_parallel(servers: List[Server], max_workers: int = 10, timeout: int = 15,
+                 install_timeout: int = 600) -> Report:
+    """Run server monitoring in parallel batches.
+
+    A server counts as a success when its 3x-ui panel is installed by this
+    run or was already present; every other server is a failure.
+    """
     report = Report(
         timestamp=datetime.now(timezone.utc).isoformat(),
         input_file="",
         servers=[],
-        summary={"total": len(servers), "success": 0, "failed": 0, "partial": 0},
+        summary={"total": len(servers), "success": 0, "failed": 0, "reachable": 0, "partial": 0},
+        x3ui_summary={"installed": 0, "preexisting": 0, "failed": 0, "not_attempted": 0},
     )
-    
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(collect_server_info, server, timeout): server 
+            executor.submit(collect_server_info, server, timeout, install_timeout): server
             for server in servers
         }
         for future in as_completed(futures):
@@ -619,11 +1038,19 @@ def run_parallel(servers: List[Server], max_workers: int = 10, timeout: int = 15
             try:
                 info = future.result()
                 report.servers.append(info)
+
                 if info.success:
-                    if info.partial_errors:
-                        report.summary["partial"] += 1
-                    else:
-                        report.summary["success"] += 1
+                    report.summary["reachable"] += 1
+                if info.partial_errors:
+                    report.summary["partial"] += 1
+
+                panel = info.x3ui
+                if panel is not None:
+                    state = panel.state if panel.state in report.x3ui_summary else "not_attempted"
+                    report.x3ui_summary[state] += 1
+
+                if panel is not None and panel.state in ("installed", "preexisting"):
+                    report.summary["success"] += 1
                 else:
                     report.summary["failed"] += 1
             except Exception as e:
@@ -632,9 +1059,17 @@ def run_parallel(servers: List[Server], max_workers: int = 10, timeout: int = 15
                     server=server,
                     success=False,
                     error=str(e),
+                    x3ui=Panel3xUI(state="not_attempted", reason=f"error: {e}"),
                 ))
                 report.summary["failed"] += 1
-    
+                report.x3ui_summary["not_attempted"] += 1
+
+    # Keep the report in input order, not completion order.
+    def _order_key(info: ServerInfo) -> Tuple[Any, ...]:
+        return (info.server.ip, info.server.port, info.server.username)
+
+    report.servers.sort(key=_order_key)
+
     return report
 
 
@@ -645,9 +1080,11 @@ def main():
     parser = argparse.ArgumentParser(description="Server Monitor - Parallel SSH")
     parser.add_argument("input_file", help="Path to input file (IP:PORT@USERNAME:PASS per line)")
     parser.add_argument("--output", help="Custom JSON output path")
-    parser.add_argument("--quiet", action="store_true", help="Suppress table output")
+    parser.add_argument("--text-output", help="Custom plain-text report path")
     parser.add_argument("--max-workers", type=int, default=10, help="Max concurrent SSH sessions (default: 10)")
     parser.add_argument("--timeout", type=int, default=15, help="SSH timeout in seconds (default: 15)")
+    parser.add_argument("--install-timeout", type=int, default=600,
+                        help="Timeout for the 3x-ui installer in seconds (default: 600)")
     parser.add_argument("--log", help="Log file path (default: server_monitor.log)")
     args = parser.parse_args()
 
@@ -671,16 +1108,16 @@ def main():
     logging.info(f"Processing {len(servers)} servers with {args.max_workers} parallel workers...")
 
     # Run parallel monitoring
-    report = run_parallel(servers, args.max_workers, args.timeout)
+    report = run_parallel(servers, args.max_workers, args.timeout, args.install_timeout)
     report.input_file = args.input_file
 
-    # Output
-    if not args.quiet:
-        print("\n" + generate_table(report))
-
+    # Output: JSON + plain-text report. No terminal table.
     json_path = save_json(report, args.output)
+    text_path = save_text_report(report, args.text_output)
     logging.info(f"JSON report saved to: {json_path}")
+    logging.info(f"Text report saved to: {text_path}")
     logging.info(f"Summary: {report.summary}")
+    logging.info(f"3x-ui: {report.x3ui_summary}")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.log
 report_*.json
+report_*.txt
 .venv/
 venv/
 servers.txt
