@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+report_*.json
+.venv/
+venv/
+servers.txt
