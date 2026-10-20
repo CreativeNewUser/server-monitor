@@ -9,6 +9,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,7 +17,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 try:
     import paramiko
@@ -183,14 +184,20 @@ class Report:
 SSH_COMMANDS = {
     "os": "cat /etc/os-release 2>/dev/null || (cat /etc/redhat-release 2>/dev/null && cat /etc/issue 2>/dev/null) || uname -srm",
     "cpu_info": "lscpu 2>/dev/null || cat /proc/cpuinfo | head -20",
-    "cpu_usage": r'top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk "{print 100 - $1}"',
+    # CPU usage from a /proc/stat delta.
+    # `top -bn1` reports the since-boot average (~0% on an idle host) and is
+    # locale-dependent, so it cannot be trusted. Two samples 1s apart give a
+    # real instantaneous figure. Uses POSIX sh only (no bashisms).
+    "cpu_usage": r"""t0=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5+$6}' /proc/stat); sleep 1; t1=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5+$6}' /proc/stat); set -- $t0 $t1; awk -v t0=$1 -v i0=$2 -v t1=$3 -v i1=$4 'BEGIN{dt=t1-t0; di=i1-i0; if(dt>0) printf "%.1f\n", 100-100*di/dt}'""",
     "ram": "free -m 2>/dev/null | awk 'NR==2{printf \"%s,%s,%s\", $2,$3,$4}'",
-    "disk": "df -h --output=source,size,used,avail,pcent,target 2>/dev/null | tail -n +2 | tr -s ' '",
+    # GNU df --output first, POSIX df -P as fallback (busybox/Alpine).
+    "disk": "(df -h --output=source,size,used,avail,pcent,target 2>/dev/null || df -P -h 2>/dev/null) | tail -n +2 | tr -s ' '",
     "server_type": "(systemd-detect-virt 2>/dev/null || echo 'unknown') && (dmidecode -s system-product-name 2>/dev/null || echo 'unknown')",
     "access_level": "whoami",
-    "public_ip": "curl -s --max-time 5 ifconfig.me 2>/dev/null || curl -s --max-time 5 icanhazip.com 2>/dev/null || curl -s --max-time 5 ipinfo.io/ip 2>/dev/null || echo 'unknown'",
-    "bandwidth": "ip -o link show 2>/dev/null | awk -F': ' '{print $2,$9}' | grep -v lo",
-    "ports": "ss -tuln 2>/dev/null | awk 'NR>1 {print $5}' | awk -F: '{print $NF}' | sort -un",
+    "public_ip": "curl -s --max-time 5 ifconfig.me 2>/dev/null | head -1; curl -s --max-time 5 icanhazip.com 2>/dev/null | head -1; curl -s --max-time 5 ipinfo.io/ip 2>/dev/null | head -1",
+    # Interface speed lives in sysfs, not in `ip link` output. -1 means unknown.
+    "bandwidth": "for d in /sys/class/net/*; do n=$(basename $d); s=$(cat $d/speed 2>/dev/null); [ -z \"$s\" ] && s=NA; [ \"$s\" = \"-1\" ] && s=NA; echo \"$n $s\"; done",
+    "ports": "ss -tulnH 2>/dev/null | awk '{print $5}' | awk -F: '{print $NF}' | sort -un",
     "top_processes": "ps aux --sort=-%cpu,-%mem | head -6 | tail -5 | awk '{printf \"%s,%s,%s,%s\\n\", $2,$11,$3,$4}'",
 }
 
@@ -281,15 +288,29 @@ def parse_disk(output: str) -> List[Dict[str, Any]]:
 
 
 def parse_server_type(output: str) -> str:
-    """Parse server type from systemd-detect-virt and dmidecode."""
+    """Parse server type from systemd-detect-virt and dmidecode.
+
+    systemd-detect-virt prints 'none' on bare metal, and a virt name on VMs.
+    'unknown' means the probe itself is unavailable.
+    """
     lines = output.strip().splitlines()
-    if len(lines) >= 2:
-        virt = lines[0].strip().lower()
-        if virt != "unknown":
-            if virt in ["kvm", "qemu", "vmware", "virtualbox", "xen", "hyperv", "docker", "lxc", "podman"]:
-                return "VM" if virt not in ["docker", "lxc", "podman"] else "container"
-            return "VM" if "virtual" in virt else "bare_metal"
-    return "unknown"
+    if not lines:
+        return "unknown"
+    virt = lines[0].strip().lower()
+    if virt in ("", "unknown"):
+        # Probe missing: fall back to container markers, else assume bare metal.
+        if "docker" in output.lower() or "lxc" in output.lower():
+            return "container"
+        return "unknown"
+    if virt == "none":
+        return "bare_metal"
+    if virt in ("docker", "lxc", "podman", "containerd"):
+        return "container"
+    if virt in ("kvm", "qemu", "vmware", "virtualbox", "xen", "hyperv", "virtualmachine"):
+        return "VM"
+    if "virtual" in virt:
+        return "VM"
+    return "bare_metal"
 
 
 def parse_access_level(output: str) -> str:
@@ -298,19 +319,23 @@ def parse_access_level(output: str) -> str:
 
 
 def parse_public_ip(output: str) -> str:
-    """Parse public IP."""
-    return output.strip()
+    """Parse public IP: keep the first line that is a bare IPv4/IPv6 address."""
+    for line in output.splitlines():
+        candidate = line.strip()
+        if re.fullmatch(r"[0-9a-fA-F:.]{3,45}", candidate) and not candidate.startswith("."):
+            return candidate
+    return "unknown"
 
 
 def parse_bandwidth(output: str) -> Dict[str, Any]:
-    """Parse bandwidth from ip link show."""
+    """Parse bandwidth from `name speed` lines (sysfs /sys/class/net/*/speed)."""
     interfaces = []
     for line in output.strip().splitlines():
         parts = line.split()
         if len(parts) >= 2:
             interfaces.append({
                 "name": parts[0],
-                "speed": parts[1] if len(parts) > 1 else "unknown",
+                "speed": parts[1],
             })
     return {"interfaces": interfaces}
 
@@ -366,18 +391,21 @@ def ssh_connect(server: Server, timeout: int = 15) -> Optional[Any]:
         return None
 
 
-def run_ssh_command(client: Any, command: str, timeout: int = 15) -> str:
-    """Run a command on a remote server via SSH."""
+def run_ssh_command(client: Any, command: str, timeout: int = 15) -> Tuple[str, Optional[str]]:
+    """Run a command on a remote server via SSH.
+
+    Returns (stdout, error). error is None on success.
+    """
     try:
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
         output = stdout.read().decode("utf-8", errors="ignore")
         error = stderr.read().decode("utf-8", errors="ignore")
         if error:
-            logging.warning(f"Command error: {command[:50]}... -> {error.strip()}")
-        return output
+            error = error.strip()
+        return output, (error or None)
     except Exception as e:
         logging.error(f"Command failed: {command[:50]}... -> {e}")
-        return ""
+        return "", str(e)
 
 
 # --- Data Collection ---
@@ -390,51 +418,38 @@ def collect_server_info(server: Server, timeout: int = 15) -> ServerInfo:
         info.error = f"SSH connection failed for {server.ip}:{server.port}"
         return info
 
+    def probe(name: str, parser: Any) -> Any:
+        """Run one probe; on failure record it and return None instead of raising."""
+        raw, err = run_ssh_command(client, SSH_COMMANDS[name], timeout)
+        if err:
+            info.partial_errors.append(f"{name}: {err[:120]}")
+        if not raw.strip():
+            info.partial_errors.append(f"{name}: empty output")
+            return None
+        try:
+            return parser(raw)
+        except Exception as e:
+            info.partial_errors.append(f"{name}: parse error {e}")
+            return None
+
     try:
-        # OS
-        os_output = run_ssh_command(client, SSH_COMMANDS["os"], timeout)
-        info.os = parse_os(os_output) if os_output else None
+        info.os = probe("os", parse_os)
+        info.cpu = probe("cpu_info", parse_cpu_info)
 
-        # CPU Info
-        cpu_info_output = run_ssh_command(client, SSH_COMMANDS["cpu_info"], timeout)
-        info.cpu = parse_cpu_info(cpu_info_output) if cpu_info_output else None
+        usage_raw, usage_err = run_ssh_command(client, SSH_COMMANDS["cpu_usage"], timeout)
+        if usage_err:
+            info.partial_errors.append(f"cpu_usage: {usage_err[:120]}")
+        if info.cpu is not None:
+            info.cpu["usage"] = parse_cpu_usage(usage_raw) if usage_raw.strip() else None
 
-        # CPU Usage
-        cpu_usage_output = run_ssh_command(client, SSH_COMMANDS["cpu_usage"], timeout)
-        if cpu_usage_output:
-            info.cpu["usage"] = parse_cpu_usage(cpu_usage_output)
-
-        # RAM
-        ram_output = run_ssh_command(client, SSH_COMMANDS["ram"], timeout)
-        info.ram = parse_ram(ram_output) if ram_output else None
-
-        # Disk
-        disk_output = run_ssh_command(client, SSH_COMMANDS["disk"], timeout)
-        info.disk = parse_disk(disk_output) if disk_output else None
-
-        # Server Type
-        server_type_output = run_ssh_command(client, SSH_COMMANDS["server_type"], timeout)
-        info.server_type = parse_server_type(server_type_output) if server_type_output else None
-
-        # Access Level
-        access_output = run_ssh_command(client, SSH_COMMANDS["access_level"], timeout)
-        info.access_level = parse_access_level(access_output) if access_output else None
-
-        # Public IP
-        public_ip_output = run_ssh_command(client, SSH_COMMANDS["public_ip"], timeout)
-        info.public_ip = parse_public_ip(public_ip_output) if public_ip_output else None
-
-        # Bandwidth
-        bandwidth_output = run_ssh_command(client, SSH_COMMANDS["bandwidth"], timeout)
-        info.bandwidth = parse_bandwidth(bandwidth_output) if bandwidth_output else None
-
-        # Ports
-        ports_output = run_ssh_command(client, SSH_COMMANDS["ports"], timeout)
-        info.ports = parse_ports(ports_output) if ports_output else None
-
-        # Top Processes
-        top_output = run_ssh_command(client, SSH_COMMANDS["top_processes"], timeout)
-        info.top_processes = parse_top_processes(top_output) if top_output else None
+        info.ram = probe("ram", parse_ram)
+        info.disk = probe("disk", parse_disk)
+        info.server_type = probe("server_type", parse_server_type)
+        info.access_level = probe("access_level", parse_access_level)
+        info.public_ip = probe("public_ip", parse_public_ip)
+        info.bandwidth = probe("bandwidth", parse_bandwidth)
+        info.ports = probe("ports", parse_ports)
+        info.top_processes = probe("top_processes", parse_top_processes)
 
         info.success = True
     except Exception as e:
@@ -496,7 +511,12 @@ def generate_table(report: Report) -> str:
     ]
     rows = []
     for info in report.servers:
-        status = "✅" if info.success else "❌"
+        if not info.success:
+            status = "❌"
+        elif info.partial_errors:
+            status = f"⚠️ {len(info.partial_errors)} partial"
+        else:
+            status = "✅"
         os_str = "?"
         if info.os:
             os_name = info.os.get('name', '?')
@@ -504,16 +524,36 @@ def generate_table(report: Report) -> str:
             os_str = f"{os_name} {os_version}".strip()
         cpu_str = "?"
         if info.cpu:
-            cpu_str = info.cpu.get('model', '?')
+            model = info.cpu.get('model', '?')
+            usage = info.cpu.get('usage')
+            if usage is None:
+                cpu_str = model
+            else:
+                cpu_str = f"{model} ({usage}%)"
         ram_str = "?"
         if info.ram:
             ram_str = str(info.ram.get('total', 0))
-        disk_str = ", ".join([f"{d['mount']}:{d['total']}G" for d in (info.disk or [])]) or "?"
+        disk_list = info.disk or []
+        # Only real filesystems, not tmpfs/devtmpfs/efivarfs pseudo-mounts.
+        disk_list = [d for d in disk_list if d["total"] > 0]
+        root = next((d for d in disk_list if d["mount"] == "/"), None)
+        if root:
+            disk_str = f"/: {root['total']}G total, {root['free']}G free"
+        elif disk_list:
+            disk_str = ", ".join(f"{d['mount']}:{d['total']}G" for d in disk_list[:2])
+        else:
+            disk_str = "?"
         server_type = info.server_type or "?"
         access = info.access_level or "?"
         public_ip = info.public_ip or "?"
-        bandwidth = ", ".join([f"{i['name']}:{i['speed']}" for i in (info.bandwidth.get("interfaces", []) if info.bandwidth else [])]) or "?"
-        ports = ", ".join(map(str, info.ports or [])) or "?"
+        ifaces = info.bandwidth.get("interfaces", []) if info.bandwidth else []
+        ifaces = [i for i in ifaces if i["name"] != "lo"]
+        known = [i for i in ifaces if i["speed"] != "NA"]
+        if known:
+            bandwidth = ", ".join(f"{i['name']}:{i['speed']}Mb" for i in known[:3])
+        else:
+            bandwidth = "?"
+        ports = ", ".join(map(str, (info.ports or [])[:8])) or "?"
         top_procs = ", ".join([f"{p['name']}({p['cpu_percent']}%CPU)" for p in (info.top_processes or [])[:3]]) or "?"
         rows.append([
             f"{info.server.ip}:{info.server.port}",
